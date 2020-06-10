@@ -1,0 +1,16 @@
+fun fib(n) {
+    var t1 = 0;
+    var t2 = 1;
+    var nextTerm = 0;
+
+    for (var i = 1; i < n; i+=1) {
+          nextTerm = t1 + t2;
+          t1 = t2;
+          t2 = nextTerm;
+    }
+    return nextTerm;
+}
+
+var start = clock();
+print fib(40);
+print clock() - start;

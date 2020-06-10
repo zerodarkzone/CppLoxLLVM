@@ -1,0 +1,54 @@
+for(var a = 0; a < 10; a+= 1)
+{
+	var realstart = -2.3;
+	var imagstart = -1.3;
+	var realmag = 0.005;
+	var imagmag = 0.007;
+	var xsize = 780;
+	var ysize = 400;
+
+
+	var xmin = realstart;
+	var xmax = realstart + realmag * xsize;
+	var xstep = realmag;
+	var ymin = imagstart;
+	var ymax = imagstart + imagmag * ysize;
+	var ystep = imagmag;
+	var stream = "";
+	for(var y = ymin; y < ymax; y += ystep)
+	{
+		for(var x = xmin; x < xmax; x += xstep)
+		{
+			
+			var real = x;
+			var imag = y;
+			var iters = 0;
+			var creal = x;
+			var cimag = y;
+			var d;
+			for(;;)
+			{
+				if (iters > 255 or (real * real + imag * imag > 4))
+				{
+					d = iters;
+					break;
+				}
+				var real_ = real * real - imag * imag + creal;
+				imag = 2 * real * imag + cimag;
+				iters = iters + 1;
+				real = real_;
+			}
+			if (d > 8)
+				stream += " ";
+			else if (d > 4)
+				stream += ".";
+			else if (d > 2)
+				stream += "+";
+			else
+				stream += "*";
+			
+		}
+		print stream;
+		stream = "";
+	}
+}

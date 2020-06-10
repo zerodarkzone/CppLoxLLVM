@@ -12,9 +12,9 @@
 #include <type_traits>
 
 #include "objType.hpp"
+#include "chunk.hpp"
 
 struct Value;
-struct Chunk;
 
 struct sObj
 {
@@ -29,17 +29,19 @@ struct sObj
 
 struct ObjString;
 
+using JitFn = std::int32_t (*)(void* vm, Value* globals, Value* stack, std::int32_t* stack_top);
 struct ObjFunction : sObj
 {
-	int arity{0};
-	Chunk& chunk;
+	uint32_t arity{0};
 	ObjString* name{nullptr};
+	JitFn function{nullptr};
+	Chunk chunk;
 
 	ObjFunction();
 	~ObjFunction();
 
 private:
-	std::aligned_storage<120, 8>::type _chunk;
+	//std::aligned_storage<120, 8>::type _chunk;
 };
 
 using NativeFn = Value (*)(int argCount, Value* args);

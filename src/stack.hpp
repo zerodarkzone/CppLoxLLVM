@@ -10,7 +10,7 @@
 #include <array>
 #include <vector>
 
-template <typename _T>
+template <typename T>
 class Stack
 {
 public:
@@ -35,49 +35,49 @@ public:
 		return m_container.capacity();
 	}
 
-	_T &top()
+	T &top()
 	{
 		return m_container.back();
 	}
 
-	const _T &top() const
+	const T &top() const
 	{
 		return m_container.back();
 	}
 
-	_T &peek(size_t offset)
+	T &peek(size_t offset)
 	{
 		return *(m_container.end() - (offset + 1u));
 	}
 
-	const _T &peek(size_t offset) const
+	const T &peek(size_t offset) const
 	{
 		return *(m_container.end() - (offset + 1u));
 	}
 
-	_T &get(size_t index)
+	T &get(size_t index)
 	{
 		return m_container[index];
 	}
 
-	const _T &get(size_t index) const
+	const T &get(size_t index) const
 	{
 		return m_container[index];
 	}
 
-	void push(_T &&value)
+	void push(T &&value)
 	{
 		m_container.push_back(std::move(value));
 	}
 
-	void push(const _T &value)
+	void push(const T &value)
 	{
 		m_container.push_back(value);
 	}
 
-	_T &pop()
+	T &pop()
 	{
-		_T &temp = m_container.back();
+		T &temp = m_container.back();
 		m_container.pop_back();
 		return temp;
 	}
@@ -90,7 +90,7 @@ public:
 	}
 
 private:
-	std::vector<_T> m_container;
+	std::vector<T> m_container;
 };
 
 template <typename _T, size_t t_size>

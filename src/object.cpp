@@ -26,11 +26,10 @@ std::ostream &operator<<(std::ostream &os, const sObj &obj)
 }
 
 
-ObjFunction::ObjFunction() : sObj(ObjType::FUNCTION), arity(0), chunk(*new (&_chunk) Chunk()), name(nullptr)
+ObjFunction::ObjFunction() : sObj(ObjType::FUNCTION), arity(0), /*chunk(*new (&_chunk) Chunk()),*/ name(nullptr)
 {}
 
 ObjFunction::~ObjFunction() {
-	chunk.~Chunk();
 }
 
 ObjNative::ObjNative(NativeFn function) : sObj(ObjType::NATIVE), function(function)

@@ -11,7 +11,8 @@
 #include "chunk.hpp"
 #include "stack.hpp"
 #include "hashTable.hpp"
-
+#include "object.hpp"
+#include "llvm_jit_utils.hpp"
 
 enum class InterpretResult
 {
@@ -22,11 +23,14 @@ enum class InterpretResult
 
 extern "C"
 {
-	void numberError(VM *vm, int32_t pc);
-	void variableError(VM *vm, uint32_t pos);
-	bool equal(Value *a, Value *b);
-	int concatenate(VM *vm, Value *a, Value *b, Value *res);
-	void print(Value *val);
+	void __declspec(dllexport) callError(VM *vm, uint32_t pc);
+	void __declspec(dllexport) numberError(VM *vm, uint32_t pc);
+	void __declspec(dllexport) variableError(VM *vm, uint32_t pos, uint32_t pc);
+	void __declspec(dllexport) arityError(VM *vm, uint32_t arity, uint32_t arg_count, uint32_t pc);
+	bool __declspec(dllexport) equal(Value *a, Value *b);
+	int __declspec(dllexport) concatenate(VM *vm, Value *out, Value *a, Value *b, uint32_t pc);
+	void __declspec(dllexport) print(Value* val);
+	void __declspec(dllexport) callNative(NativeFn fun, uint32_t argCount, Value *args, Value *out);
 }
 
 struct CallFrame
@@ -55,6 +59,7 @@ private:
 	bool callValue(Value callee, int argCount);
 	void defineNative(std::string_view name, NativeFn function);
 	InterpretResult run();
+	void prepareJit();
 	InterpretResult runJitted();
 	uint8_t readByte();
 	uint16_t readShort();
@@ -72,27 +77,30 @@ private:
 	void runtimeError(Types ... args);
 
 	template <typename ... Types>
-	void runtimeError(int pc, Types ... args);
+	void runtimeError(uint32_t pc, Types ... args);
 
 	std::array<CallFrame, STACK_MAX> m_frames;
 	uint32_t m_frameCount = 0;
 	CallFrame* m_frame = nullptr;
 
 	FixedStack<Value, 125000> m_stack;
-	HashTable<std::string, sObj*> m_strings;
+	HashTable<std::string, ObjString*> m_strings;
 	HashTable<std::string, Value> m_globals;
 	std::vector<std::string> m_globalNames;
 	std::vector<Value> m_globalValues;
 
 	Compiler m_compiler;
-	sObj *m_objects = nullptr;
+	Obj *m_objects = nullptr;
+	std::unique_ptr<SimpleOrcJIT> m_jit;
 
 
-	friend void numberError(VM *vm, int32_t pc);
-	friend void variableError(VM *vm, uint32_t pos);
+	friend void callError(VM *vm, uint32_t pc);
+	friend void numberError(VM *vm, uint32_t pc);
+	friend void variableError(VM *vm, uint32_t pos, uint32_t pc);
+	friend void arityError(VM *vm, uint32_t arity, uint32_t arg_count, uint32_t pc);
 	friend bool equal(Value *a, Value *b);
-	friend int concatenate(VM *vm, Value *a, Value *b, Value *res);
-	friend void print(Value *val);
+	friend int concatenate(VM *vm, Value *out, Value *a, Value *b, uint32_t pc);
+	friend void print(Value* val);
 
 };
 

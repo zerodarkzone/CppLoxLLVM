@@ -13,10 +13,10 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/IR/Function.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Transforms/IPO/PassManagerBuilder.h>
-#include <llvm/Transforms/IPO/GlobalDCE.h>
-#include "llvm/Transforms/IPO.h"
+#include <llvm/Transforms/IPO.h>
 
 #include "llvm_jit_utils.hpp"
 #include "utils.hpp"
@@ -29,6 +29,10 @@
 
 VM::VM()
 {
+	llvm::InitializeNativeTarget();
+	llvm::InitializeNativeTargetAsmPrinter();
+	m_jit = std::make_unique<SimpleOrcJIT>(true);
+
 	defineNative("clock", clockNative);
 }
 
@@ -48,7 +52,7 @@ InterpretResult VM::interpret(const std::string &source)
 	m_stack.push(Value::Object(function));
 	callValue(Value::Object(function), 0);
 
-	auto result = run();//runJitted();
+	auto result = runJitted();
 
 	return result;
 }
@@ -119,8 +123,8 @@ void VM::defineNative(std::string_view name, NativeFn function)
 
 	m_globalValues.push_back(m_stack.get(0));
 	m_globalNames.emplace_back(name);
-	auto newIdex = m_globalValues.size() - 1;
-	m_globals[std::string(name)] = Value::Number(newIdex);
+	auto newIndex = m_globalValues.size() - 1;
+	m_globals[std::string(name)] = Value::Number(newIndex);
 
 	m_stack.pop();
 }
@@ -135,8 +139,49 @@ void llvm_module_to_file(const llvm::Module& module, const char* filename) {
 	of << os.str();
 }
 
+int test_fn(void* vm, Value* glob, Value* stack, int *stack_top)
+{
+	std::cout << stack[*stack_top - 1] << std::endl;
+	stack[*stack_top] = Value::Number(72);
+	*stack_top = *stack_top + 1;
+	return static_cast<int>(InterpretResult::OK);
+}
+
+void compileFunctions(llvm::Module* module, Chunk* chunk, const std::string& name, llvm::GlobalValue::LinkageTypes Linkage, llvm::StructType* value_type, llvm::PointerType* valutePtr_type, std::vector<llvm::Function*> &functions)
+{
+	functions.push_back(generade_code(module, chunk, name, Linkage, value_type, valutePtr_type));
+	for (size_t i = 0; i < chunk->constantsSize(); ++i)
+	{
+		auto &constant = chunk->constants()[i];
+		if (constant.isObjFunction())
+		{
+			compileFunctions(module, &constant.asObjFunction()->chunk, constant.asObjFunction()->name->value, llvm::Function::ExternalLinkage, value_type, valutePtr_type, functions);
+		}
+	}
+}
+
+void setCompiledFunctions(Chunk* chunk, SimpleOrcJIT* jit)
+{
+	for (size_t i = 0; i < chunk->constantsSize(); ++i)
+	{
+		auto &constant = chunk->constants()[i];
+		if (constant.isObjFunction())
+		{
+			llvm::JITSymbol func_sym = jit->find_symbol(constant.asObjFunction()->name->value);
+			if (!func_sym) {
+				DIE << "Unable to find symbol " << "_main_func" << " in module";
+			}
+			JitFn func_ptr =
+				reinterpret_cast<JitFn>(func_sym.getAddress().get());
+			constant.asObjFunction()->function = func_ptr;
+			setCompiledFunctions(&constant.asObjFunction()->chunk, jit);
+		}
+	}
+}
+
 InterpretResult VM::runJitted()
 {
+	m_frame = &m_frames[m_frameCount - 1];
 	//auto start = std::chrono::steady_clock::now();
 	auto verbose = true;
 
@@ -163,14 +208,77 @@ InterpretResult VM::runJitted()
 
 	llvm::Type* uint8_type = llvm::Type::getInt8Ty(context);
 	llvm::Type* double_type = llvm::Type::getDoubleTy(context);
+	llvm::Type* uint64_type = llvm::Type::getInt64Ty(context);
+	llvm::Type* int32_type = llvm::Type::getInt32Ty(context);
+	llvm::Type* void_type = llvm::Type::getVoidTy(context);
+
+	llvm::PointerType* voidPtr_type = llvm::Type::getInt8PtrTy(context);
 
 	llvm::StructType* value_type = llvm::StructType::create(context, {uint8_type, double_type}, "Value");
 	llvm::PointerType* valutePtr_type = llvm::PointerType::get(value_type, 0);
 
+	llvm::Function* callError_func = llvm::Function::Create(
+		llvm::FunctionType::get(void_type, {voidPtr_type, int32_type}, false),
+		llvm::Function::ExternalLinkage, "callError", module.get());
+	//numberError_func->setOnlyReadsMemory();
+	callError_func->setOnlyAccessesArgMemory();
+	callError_func->setDoesNotThrow();
+
+	llvm::Function* numberError_func = llvm::Function::Create(
+		llvm::FunctionType::get(void_type, {voidPtr_type, int32_type}, false),
+		llvm::Function::ExternalLinkage, "numberError", module.get());
+	//numberError_func->setOnlyReadsMemory();
+	numberError_func->setOnlyAccessesArgMemory();
+	numberError_func->setDoesNotThrow();
+
+	llvm::Function* variableError_func = llvm::Function::Create(
+		llvm::FunctionType::get(void_type, {voidPtr_type, int32_type, int32_type}, false),
+		llvm::Function::ExternalLinkage, "variableError", module.get());
+	//variableError_func->setOnlyReadsMemory();
+	variableError_func->setOnlyAccessesArgMemory();
+	variableError_func->setDoesNotThrow();
+
+	llvm::Function* arityError_func = llvm::Function::Create(
+		llvm::FunctionType::get(void_type, {voidPtr_type, int32_type, int32_type, int32_type}, false),
+		llvm::Function::ExternalLinkage, "arityError", module.get());
+	//variableError_func->setOnlyReadsMemory();
+	arityError_func->setOnlyAccessesArgMemory();
+	arityError_func->setDoesNotThrow();
+
+	llvm::Function* concatenate_func = llvm::Function::Create(
+		llvm::FunctionType::get(int32_type,
+								{voidPtr_type, valutePtr_type, valutePtr_type, valutePtr_type, int32_type}, false),
+		llvm::Function::ExternalLinkage, "concatenate", module.get());
+	concatenate_func->setOnlyAccessesArgMemory();
+	concatenate_func->setDoesNotThrow();
+	//concatenate_func->addAttribute(2, llvm::Attribute::StructRet);
+	//concatenate_func->addAttribute(2, llvm::Attribute::NoAlias);
+	//concatenate_func->addAttribute(3, llvm::Attribute::ByVal);
+	//concatenate_func->addAttribute(4, llvm::Attribute::ByVal);
+
+	llvm::Function* print_func = llvm::Function::Create(
+		llvm::FunctionType::get(void_type, {valutePtr_type}, false),
+		llvm::Function::ExternalLinkage, "print", module.get());
+	print_func->setOnlyAccessesArgMemory();
+	print_func->setDoesNotThrow();
+
+
+	llvm::FunctionType* native_func_type =  llvm::FunctionType::get(value_type,{int32_type, valutePtr_type}, false);
+	llvm::Function* callNative_func = llvm::Function::Create(
+		llvm::FunctionType::get(void_type, {llvm::PointerType::get(native_func_type, 0), int32_type, valutePtr_type, valutePtr_type}, false),
+		llvm::Function::ExternalLinkage, "callNative", module.get());
+	callNative_func->setOnlyAccessesArgMemory();
+	callNative_func->setDoesNotThrow();
+
+
 	llvm::Function* falsey_func = generate_falsey(module.get(), value_type, valutePtr_type);
 	llvm::Function* equal_func = generate_equal(module.get(), value_type, valutePtr_type);
-	//llvm::Function* jit_func = generade_code(module.get(), this->m_chunk, value_type, valutePtr_type);
-	llvm::Function* jit_func = generade_code(module.get(), &m_frame->function->chunk, value_type, valutePtr_type);
+	//llvm::Function* jit_func = generade_code(module.get(), &m_frame->function->chunk, "_jit_func", value_type, valutePtr_type);
+	std::vector<llvm::Function*> functions;
+	compileFunctions(module.get(), &m_frame->function->chunk, "_jit_func", llvm::Function::InternalLinkage, value_type, valutePtr_type, functions);
+	static int m_ = 0;
+	std::string main_name = "_main" + std::to_string(m_++);
+	llvm::Function* main_func = generate_main(module.get(), main_name, value_type, valutePtr_type);
 
 	if (verbose) {
 		const char* pre_opt_file = "llvmjit-pre-opt.ll";
@@ -178,8 +286,13 @@ InterpretResult VM::runJitted()
 		std::cout << "[Pre optimization module] dumped to " << pre_opt_file << "\n";
 	}
 
-	if (llvm::verifyFunction(*jit_func, &llvm::errs()))
+	if (llvm::verifyFunction(*main_func, &llvm::errs()))
 		DIE << "Error verifying function.";
+	for(auto func: functions)
+	{
+		if (llvm::verifyFunction(*func, &llvm::errs()))
+			DIE << "Error verifying function.";
+	}
 	if (llvm::verifyFunction(*falsey_func, &llvm::errs()))
 		DIE << "Error verifying function.";
 	if (llvm::verifyFunction(*equal_func, &llvm::errs()))
@@ -187,32 +300,8 @@ InterpretResult VM::runJitted()
 
 	// Optimize the emitted LLVM IR.
 	Timer topt;
-	llvm::InitializeNativeTarget();
-	llvm::InitializeNativeTargetAsmPrinter();
 
-	llvm::PassManagerBuilder pm_builder;
-	pm_builder.OptLevel = 3;
-	pm_builder.SizeLevel = 0;
-	pm_builder.LoopVectorize = true;
-	pm_builder.SLPVectorize = true;
-	pm_builder.PerformThinLTO = true;
-	pm_builder.Inliner = llvm::createFunctionInliningPass(3, 0, true);
-
-	llvm::legacy::FunctionPassManager function_pm(module.get());
-	llvm::legacy::PassManager module_pm;
-
-	pm_builder.populateFunctionPassManager(function_pm);
-	pm_builder.populateModulePassManager(module_pm);
-
-	function_pm.doInitialization();
-	function_pm.run(*equal_func);
-	function_pm.run(*falsey_func);
-	function_pm.run(*jit_func);
-	module_pm.run(*module);
-
-	function_pm.doInitialization();
-	function_pm.run(*jit_func);
-	module_pm.run(*module);
+	optimizeModule(&m_jit->get_target_machine(), module.get(), 3, 0);
 
 	if (verbose) {
 		std::cout << "[Optimization elapsed:] " << topt.elapsed() << "s\n";
@@ -223,25 +312,24 @@ InterpretResult VM::runJitted()
 	}
 
 	// JIT the optimized LLVM IR to native code and execute it.
-	SimpleOrcJIT jit(/*verbose=*/true);
-	module->setDataLayout(jit.get_target_machine().createDataLayout());
-	jit.add_module(std::move(module));
+	m_jit->add_module(std::move(module));
 
-	llvm::JITSymbol jit_func_sym = jit.find_symbol("_jit_func");
-	if (!jit_func_sym) {
-		DIE << "Unable to find symbol " << "_jit_func" << " in module";
+	llvm::JITSymbol main_func_sym = m_jit->find_symbol(main_name);
+	if (!main_func_sym) {
+		DIE << "Unable to find symbol " << "_main_func" << " in module";
 	}
 
-	using JitFuncType = int32_t (*)(void*, Value*, Value*, Value*);
-	JitFuncType jit_func_ptr =
-			reinterpret_cast<JitFuncType>(jit_func_sym.getAddress().get());
+	using MainFuncType = int32_t (*)(void*, Value*,  Value*);
+	MainFuncType main_func_ptr =
+			reinterpret_cast<MainFuncType>(main_func_sym.getAddress().get());
+
+	setCompiledFunctions(&m_frame->function->chunk, m_jit.get());
 
 	auto vm_ = this;
-	auto stack = &m_stack.get(0);
-	auto constants = m_frame->function->chunk.constants();//m_chunk->constants();
 	auto globals = m_globalValues.data();
+	auto stack = &m_stack.get(0);
 
-	auto result = jit_func_ptr(vm_, stack, constants, globals);
+	auto result = main_func_ptr(vm_, globals, stack);
 
 	return static_cast<InterpretResult>(result);
 }

@@ -9,8 +9,7 @@
 
 #include "value.hpp"
 
-
-static inline Value clockNative(int argCount, Value* args)
+inline Value clockNative(int argCount, Value *args)
 {
 	using namespace std::chrono;
 	auto now = std::chrono::system_clock::now();
@@ -21,8 +20,7 @@ static inline Value clockNative(int argCount, Value* args)
 	date->tm_min = 0;
 	date->tm_sec = 0;
 	auto midnight = std::chrono::system_clock::from_time_t(std::mktime(date));
-
-	return Value::Number(duration<double>(duration_cast<milliseconds>(now-midnight)).count());
+	return Value::Number(duration<double>(duration_cast<milliseconds>(now - midnight)).count());
 }
 
 #endif //CPPLOX_NATIVEFUNCTIONS_HPP

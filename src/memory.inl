@@ -1,7 +1,7 @@
 #include "vm.hpp"
 
 template<typename _T, typename... _Types>
-sObj* Memory::createObject(VM *vm, _Types... args)
+_T* Memory::createObject(VM *vm, _Types... args)
 {
 	auto obj = new _T(args...);
 	obj->next = vm->m_objects;

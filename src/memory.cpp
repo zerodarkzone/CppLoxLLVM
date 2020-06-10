@@ -24,6 +24,7 @@ void Memory::destroyObject(sObj *obj)
 	{
 		case ObjType::FUNCTION: {
 			auto function = static_cast<ObjFunction *>(obj);
+			function->function = nullptr;
 			delete function;
 			break;
 		}

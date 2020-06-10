@@ -9,24 +9,25 @@
 
 void disassembleChunk(const Chunk &chunk, std::string name)
 {
-	std::cout << "== " << name << " ==" << std::endl;
+	std::cout << "== " << name << " ==" << "\n";
 
 	for (size_t i = 0u, size = chunk.size(); i < size;)
 	{
 		i = disassembleInstruction(chunk, i);
 	}
+	std::cout.flush();
 }
 
 static size_t simpleInstruction(const std::string &name, size_t offset)
 {
-	std::cout << name << std::endl;
+	std::cout << name << "\n";
 	return offset + 1;
 }
 
 static size_t byteInstruction(const std::string &name, const Chunk &chunk, size_t offset) {
 	uint16_t slot = chunk.get(offset + 1);
 	std::cout << std::setiosflags(std::ios::left) << std::setw(16) << std::setfill(' ') << name;
-	std::cout << std::resetiosflags(std::ios::left) << std::setw(4) << slot << std::endl;
+	std::cout << std::resetiosflags(std::ios::left) << std::setw(4) << slot << "\n";
 	return offset + 2;
 }
 
@@ -34,7 +35,7 @@ static size_t shortInstruction(const std::string &name, const Chunk &chunk, size
 	uint16_t slot = chunk.get(offset + 1u) |
 		static_cast<uint16_t>(chunk.get(offset + 2u) << 8u);
 	std::cout << std::setiosflags(std::ios::left) << std::setw(16) << std::setfill(' ') << name;
-	std::cout << std::resetiosflags(std::ios::left) << std::setw(4) << slot << std::endl;
+	std::cout << std::resetiosflags(std::ios::left) << std::setw(4) << slot << "\n";
 	return offset + 3;
 }
 
@@ -43,7 +44,7 @@ static size_t longInstruction(const std::string &name, const Chunk &chunk, size_
 		static_cast<uint32_t>(chunk.get(offset + 2u) << 8u) |
 		static_cast<uint32_t>(chunk.get(offset + 3u) << 16u);
 	std::cout << std::setiosflags(std::ios::left) << std::setw(16) << std::setfill(' ') << name;
-	std::cout << std::resetiosflags(std::ios::left) << std::setw(4) << slot << std::endl;
+	std::cout << std::resetiosflags(std::ios::left) << std::setw(4) << slot << "\n";
 	return offset + 4;
 }
 
@@ -52,7 +53,7 @@ static size_t jumpInstruction(const std::string &name, int sign, const Chunk &ch
 			static_cast<uint16_t>(chunk.get(offset + 2u) << 8u);
 	std::cout << std::setiosflags(std::ios::left) << std::setw(16) << std::setfill(' ') << name;
 	std::cout << std::resetiosflags(std::ios::left) << std::setw(4) << offset << " ";
-	std::cout << "-> " << offset + 3 + sign * jump << std::endl;
+	std::cout << "-> " << offset + 3 + sign * jump << "\n";
 	return offset + 3;
 }
 
@@ -61,7 +62,7 @@ static size_t constantInstruction(const std::string &name, const Chunk &chunk, s
 	uint16_t constant = chunk.get(offset + 1u);
 	std::cout << std::setiosflags(std::ios::left) << std::setw(16) << std::setfill(' ') << name;
 	std::cout << std::resetiosflags(std::ios::left) << std::setw(4) << constant << " '";
-	std::cout << chunk.getConstant(constant) << "'" << std::endl;
+	std::cout << chunk.getConstant(constant) << "'" << "\n";
 	return offset + 2;
 }
 
@@ -72,7 +73,7 @@ static size_t longConstantInstruction(const std::string &name, const Chunk &chun
 		static_cast<uint32_t>(chunk.get(offset + 3) << 16u);
 	std::cout << std::setiosflags(std::ios::left) << std::setw(16) << std::setfill(' ') << name;
 	std::cout << std::resetiosflags(std::ios::left) << std::setw(4) << constant << " '";
-	std::cout << chunk.getConstant(constant) << "'" << std::endl;
+	std::cout << chunk.getConstant(constant) << "'" << "\n";
 	return offset + 4;
 }
 
@@ -160,7 +161,7 @@ size_t disassembleInstruction(const Chunk &chunk, size_t offset)
 		case OpCode::RETURN:
 			return simpleInstruction("OP_RETURN", offset);
 		default:
-			std::cout << "Unknown opcode " << instruction << std::endl;
+			std::cout << "Unknown opcode " << instruction << "\n";
 			return offset + 1;
 	}
 }

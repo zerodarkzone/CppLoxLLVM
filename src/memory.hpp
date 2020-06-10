@@ -14,7 +14,7 @@ class Memory
 {
 public:
 	template <typename _T, typename ... _Types>
-	static sObj* createObject(VM *vm, _Types ... args);
+	static _T* createObject(VM *vm, _Types ... args);
 	static ObjString* createString(VM *vm, const std::string &str);
 	static ObjString* createString(VM *vm, std::string_view str);
 	static ObjFunction* createFunction(VM *vm);

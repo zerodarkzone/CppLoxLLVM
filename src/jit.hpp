@@ -10,7 +10,8 @@
 class VM;
 class Chunk;
 
-llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructType* value_type, llvm::PointerType* valutePtr_type);
+llvm::Function* generate_main(llvm::Module* module, const std::string& name, llvm::StructType* value_type, llvm::PointerType* valutePtr_type);
+llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, const std::string& name, llvm::GlobalValue::LinkageTypes linkage, llvm::StructType* value_type, llvm::PointerType* valutePtr_type);
 llvm::Function* generate_falsey(llvm::Module* module, llvm::StructType* value_type, llvm::PointerType* valutePtr_type);
 llvm::Function* generate_equal(llvm::Module* module, llvm::StructType* value_type, llvm::PointerType* valutePtr_type);
 

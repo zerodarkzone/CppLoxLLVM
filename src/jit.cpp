@@ -3,7 +3,6 @@
 //
 
 #include <cmath>
-#include <unordered_set>
 #include <vector>
 #include <iomanip>
 
@@ -12,8 +11,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/TargetSelect.h>
-#include <llvm/Transforms/IPO/PassManagerBuilder.h>
-#include <llvm/IR/LegacyPassManager.h>
+#include <llvm/ExecutionEngine/ExecutionEngine.h>
 
 #include "jit.hpp"
 #include "chunk.hpp"
@@ -33,8 +31,8 @@ extern "C" void dump_memory(uint8_t* memory) {
 	for (size_t i = 0, pcount = 0; i < MEMORY_SIZE; ++i) {
 		if (memory[i]) {
 			std::cout << std::right << "[" << std::setw(3) << i
-			          << "] = " << std::setw(3) << std::left
-			          << static_cast<int32_t>(memory[i]) << "      ";
+					  << "] = " << std::setw(3) << std::left
+					  << static_cast<int32_t>(memory[i]) << "      ";
 			pcount++;
 
 			if (pcount > 0 && pcount % 4 == 0) {
@@ -45,68 +43,83 @@ extern "C" void dump_memory(uint8_t* memory) {
 	std::cout << "\n";
 }
 
-extern "C" void numberError(VM* vm, int32_t pc)
+extern "C" __declspec(dllexport) void callError(VM* vm, uint32_t pc)
+{
+	using namespace std::string_literals;
+	vm->runtimeError(pc, "Object is not callable."s);
+}
+
+extern "C" __declspec(dllexport) void numberError(VM* vm, uint32_t pc)
 {
 	using namespace std::string_literals;
 	vm->runtimeError(pc, "Operands must be numbers."s);
 }
 
-extern "C" void variableError(VM* vm, uint32_t pos)
+extern "C" __declspec(dllexport) void variableError(VM *vm, uint32_t pos, uint32_t pc)
 {
 	using namespace std::string_literals;
-	vm->runtimeError("Undefined variable "s, vm->m_globalNames[pos], "."s);
+	vm->runtimeError(pc, "Undefined variable "s, vm->m_globalNames[pos], "."s);
 }
 
-extern "C" bool equal(Value *a, Value *b)
+extern "C" __declspec(dllexport) void arityError(VM *vm, uint32_t arity, uint32_t arg_count, uint32_t pc)
+{
+	using namespace std::string_literals;
+	vm->runtimeError(pc, "Expected "s, std::to_string(arity), " arguments but got "s, std::to_string(arg_count), "."s);
+}
+
+extern "C" __declspec(dllexport) bool equal(Value *a, Value *b)
 {
 	return *a == *b;
 }
 
-extern "C" int concatenate(VM *vm, Value *a, Value *b, Value *res)
+extern "C" __declspec(dllexport) int concatenate(VM *vm, Value *out, Value *a, Value *b, uint32_t pc)
 {
-	if (b->isObjString() && a->isObjString())
+	if (a->isObjString() && b->isObjString())
 	{
-		auto b_str = b->asObjString()->value;
-		auto a_str = a->asObjString()->value;
-		*res = Value::Object(Memory::createString(vm, a_str + b_str));
+		*out = Value::Object(Memory::createString(vm, a->asObjString()->value + b->asObjString()->value));
 	}
-	else if(b->isObjString() && a->isNumber())
+	else if(a->isNumber() && b->isObjString())
 	{
 		auto b_str = b->asObjString()->value;
 		auto a_num = a->asNumber();
-		char buff[128];
+		char buff[1024];
 		std::sprintf(buff, "%g", a_num);
-		*res = Value::Object(Memory::createString(vm, std::string(buff) + b_str));
+		*out = Value::Object(Memory::createString(vm, std::string(buff) + b_str));
 	}
-	else if(b->isNumber() && a->isObjString())
+	else if(a->isObjString() && b->isNumber())
 	{
 		auto b_num = b->asNumber();
 		auto a_str = a->asObjString()->value;
 		char buff[1024];
 		std::sprintf(buff, "%g", b_num);
-		*res = Value::Object(Memory::createString(vm, a_str + std::string(buff)));
+		*out = Value::Object(Memory::createString(vm, a_str + std::string(buff)));
 	}
 	else
 	{
-		vm->runtimeError("Operands must be numbers or strings.");
+		vm->runtimeError(pc, "Operands must be numbers or strings.");
 		return (int)InterpretResult::RUNTIME_ERROR;
 	}
 	return (int)InterpretResult::OK;
 }
 
-extern "C" void print(Value* val)
+extern "C" __declspec(dllexport) void print(Value* val)
 {
 	std::cout << *val << std::endl;
 }
 
-std::unordered_set<uint32_t> jumpBlocks(Chunk* chunk)
+extern "C" __declspec(dllexport) void callNative(NativeFn fun, uint32_t argCount, Value *args, Value *out)
+{
+	*out = fun(argCount, args);
+}
+
+std::vector<uint32_t> jumpBlocks(Chunk* chunk)
 {
 	auto size = chunk->size();
-	std::unordered_set<uint32_t> labels;
+	std::vector<uint32_t> labels;
 
 	for (auto offset = 0u; offset < size;)
 	{
-		labels.insert(offset);
+		labels.push_back(offset);
 		auto instruction = chunk->get(offset);
 		switch (instruction)
 		{
@@ -116,10 +129,15 @@ std::unordered_set<uint32_t> jumpBlocks(Chunk* chunk)
 			case OpCode::GET_GLOBAL:
 			case OpCode::DEFINE_GLOBAL:
 			case OpCode::SET_GLOBAL:
+			case OpCode::CALL:
 				offset += 2;
 				break;
 			case OpCode::GET_LOCAL_SHORT:
 			case OpCode::SET_LOCAL_SHORT:
+			case OpCode::JUMP:
+			case OpCode::JUMP_IF_FALSE:
+			case OpCode::JUMP_IF_TRUE:
+			case OpCode::JUMP_BACK:
 				offset += 3;
 				break;
 			case OpCode::CONSTANT_LONG:
@@ -128,38 +146,6 @@ std::unordered_set<uint32_t> jumpBlocks(Chunk* chunk)
 			case OpCode::SET_GLOBAL_LONG:
 				offset += 4;
 				break;
-			case OpCode::JUMP:
-			{
-				uint16_t jump = chunk->get(offset + 1u) |
-								static_cast<uint16_t>(chunk->get(offset + 2u) << 8u);
-				//labels.insert(offset + 3 + jump);
-				offset += 3;
-				break;
-			}
-			case OpCode::JUMP_IF_FALSE:
-			{
-				uint16_t jump = chunk->get(offset + 1u) |
-								static_cast<uint16_t>(chunk->get(offset + 2u) << 8u);
-				//labels.insert(offset + 3 + jump);
-				offset += 3;
-				break;
-			}
-			case OpCode::JUMP_IF_TRUE:
-			{
-				uint16_t jump = chunk->get(offset + 1u) |
-								static_cast<uint16_t>(chunk->get(offset + 2u) << 8u);
-				//labels.insert(offset + 3 + jump);
-				offset += 3;
-				break;
-			}
-			case OpCode::JUMP_BACK:
-			{
-				uint16_t jump = chunk->get(offset + 1u) |
-								static_cast<uint16_t>(chunk->get(offset + 2u) << 8u);
-				//labels.insert(offset + 3 - jump);
-				offset += 3;
-				break;
-			}
 			default:
 				offset += 1;
 				break;
@@ -176,16 +162,13 @@ llvm::Function* generate_equal(llvm::Module* module, llvm::StructType* value_typ
 	llvm::PointerType* in64Ptr_type = llvm::Type::getInt64PtrTy(context);
 
 	llvm::FunctionType* jit_func_type =
-			llvm::FunctionType::get(bool_type, {valutePtr_type, valutePtr_type}, false);
+		llvm::FunctionType::get(bool_type, {valutePtr_type, valutePtr_type}, false);
 	llvm::Function* jit_func = llvm::Function::Create(
-			jit_func_type, llvm::Function::InternalLinkage, "_equal", module);
+		jit_func_type, llvm::Function::InternalLinkage, "_equal", module);
 
 	llvm::BasicBlock* entry_bb =
-			llvm::BasicBlock::Create(context, "entry", jit_func);
+		llvm::BasicBlock::Create(context, "entry", jit_func);
 	llvm::IRBuilder<> builder(entry_bb);
-
-	auto type_number = builder.getInt8(static_cast<uint8_t>(ValueType::NUMBER));
-
 
 	llvm::Argument* a_ptr = jit_func->arg_begin();
 	llvm::Argument* b_ptr = jit_func->arg_begin() + 1;
@@ -197,7 +180,7 @@ llvm::Function* generate_equal(llvm::Module* module, llvm::StructType* value_typ
 	llvm::Value* b_type = builder.CreateLoad(b_type_ptr, false, "val_type");
 
 	llvm::BasicBlock* then_bb = llvm::BasicBlock::Create(context, "then", jit_func);
-	llvm::BasicBlock* else_bb = llvm::BasicBlock::Create(context, "then", jit_func);
+	llvm::BasicBlock* else_bb = llvm::BasicBlock::Create(context, "else", jit_func);
 	llvm::Value* ne_type = builder.CreateICmpNE(a_type, b_type, "ne_type");
 	builder.CreateCondBr(ne_type, then_bb, else_bb);
 	builder.SetInsertPoint(then_bb);
@@ -214,44 +197,6 @@ llvm::Function* generate_equal(llvm::Module* module, llvm::StructType* value_typ
 
 	builder.CreateRet(builder.CreateICmpEQ(a_value, b_value));
 
-
-	/*llvm::BasicBlock* def_bb = llvm::BasicBlock::Create(context, "default", jit_func);
-	llvm::BasicBlock* num_bb = llvm::BasicBlock::Create(context, "number", jit_func);
-	llvm::BasicBlock* bool_bb = llvm::BasicBlock::Create(context, "bool", jit_func);
-	llvm::BasicBlock* obj_bb = llvm::BasicBlock::Create(context, "obj", jit_func);
-
-	llvm::SwitchInst* sw = builder.CreateSwitch(a_type, def_bb, 3);
-	sw->addCase(type_bool, bool_bb);
-	sw->addCase(type_obj, obj_bb);
-	sw->addCase(type_number, num_bb);
-
-	builder.SetInsertPoint(bool_bb);
-	llvm::Value* a_bool_ptr = builder.CreateBitCast(a_value_ptr, boolPtr_type, "a_bool_ptr");
-	llvm::Value* a_bool = builder.CreateLoad(a_bool_ptr, "a_bool");
-
-	llvm::Value* b_bool_ptr = builder.CreateBitCast(b_value_ptr, boolPtr_type, "b_bool_ptr");
-	llvm::Value* b_bool = builder.CreateLoad(b_bool_ptr, "b_bool");
-
-	builder.CreateRet(builder.CreateICmpEQ(a_bool, b_bool));
-
-	builder.SetInsertPoint(obj_bb);
-	llvm::Value* a_obj_ptr = builder.CreateBitCast(a_value_ptr, in64Ptr_type, "a_obj_ptr");
-	llvm::Value* a_obj = builder.CreateLoad(a_obj_ptr, "a_obj");
-
-	llvm::Value* b_obj_ptr = builder.CreateBitCast(b_value_ptr, in64Ptr_type, "b_obj_ptr");
-	llvm::Value* b_obj = builder.CreateLoad(b_obj_ptr, "b_obj");
-
-	builder.CreateRet(builder.CreateICmpEQ(a_obj, b_obj));
-
-	builder.SetInsertPoint(num_bb);
-	llvm::Value* a_val = builder.CreateLoad(a_value_ptr, "a_val");
-	llvm::Value* b_val = builder.CreateLoad(b_value_ptr, "b_val");
-
-	builder.CreateRet(builder.CreateFCmpOEQ(a_val, b_val));
-
-	builder.SetInsertPoint(def_bb);*/
-	//builder.CreateRet(builder.getTrue());
-
 	return jit_func;
 }
 
@@ -263,12 +208,12 @@ llvm::Function* generate_falsey(llvm::Module* module, llvm::StructType* value_ty
 	llvm::PointerType* boolPtr_type = llvm::Type::getInt1PtrTy(context);
 
 	llvm::FunctionType* jit_func_type =
-			llvm::FunctionType::get(bool_type, {valutePtr_type}, false);
+		llvm::FunctionType::get(bool_type, {valutePtr_type}, false);
 	llvm::Function* jit_func = llvm::Function::Create(
-			jit_func_type, llvm::Function::InternalLinkage, "_is_falsey", module);
+		jit_func_type, llvm::Function::InternalLinkage, "_is_falsey", module);
 
 	llvm::BasicBlock* entry_bb =
-			llvm::BasicBlock::Create(context, "entry", jit_func);
+		llvm::BasicBlock::Create(context, "entry", jit_func);
 	llvm::IRBuilder<> builder(entry_bb);
 
 	auto type_bool = builder.getInt8(static_cast<uint8_t>(ValueType::BOOL));
@@ -313,88 +258,126 @@ llvm::Function* generate_falsey(llvm::Module* module, llvm::StructType* value_ty
 	return jit_func;
 }
 
-llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructType* value_type, llvm::PointerType* valutePtr_type)
+void gen_if_else_jmp(llvm::Value* cmp, llvm::AllocaInst* pc, int then_off, int else_off, llvm::IRBuilder<>& builder, 
+	llvm::LLVMContext& context, llvm::Function* jit_func, llvm::BasicBlock* rtn)
+{
+	llvm::BasicBlock* then_bb = llvm::BasicBlock::Create(context, "then_jmp", jit_func);
+	llvm::BasicBlock* else_bb = llvm::BasicBlock::Create(context, "else_jmp", jit_func);
+	llvm::BasicBlock* end_bb = llvm::BasicBlock::Create(context, "end_jmp", jit_func);
+
+	builder.CreateCondBr(cmp, then_bb, else_bb);
+
+	builder.SetInsertPoint(then_bb);
+	llvm::Value* pc_ = builder.CreateLoad(pc, "pc_jmp");
+	llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(then_off), "inc_pc_jmp");
+	builder.CreateStore(inc_pc, pc);
+	builder.CreateBr(end_bb);
+	
+	builder.SetInsertPoint(else_bb);
+	pc_ = builder.CreateLoad(pc, "pc_jmp");
+	inc_pc = builder.CreateAdd(pc_, builder.getInt32(else_off), "inc_pc_jmp");
+	builder.CreateStore(inc_pc, pc);
+	builder.CreateBr(end_bb);
+
+	builder.SetInsertPoint(end_bb);
+	builder.CreateBr(rtn);
+}
+
+llvm::Function* generate_main(llvm::Module* module, const std::string& name, llvm::StructType* value_type, llvm::PointerType* valutePtr_type)
+{
+	llvm::LLVMContext& context = module->getContext();
+
+	llvm::Type* int32_type = llvm::Type::getInt32Ty(context);
+	llvm::Type* void_type = llvm::Type::getVoidTy(context);
+	llvm::PointerType* voidPtr_type = llvm::Type::getInt8PtrTy(context);
+
+	// Create function signature and object. int (*)(VM* vm, Value* globals)
+	llvm::FunctionType* main_func_type =
+		llvm::FunctionType::get(int32_type, {voidPtr_type, valutePtr_type, valutePtr_type}, false);
+	llvm::Function* main_func = llvm::Function::Create(
+		main_func_type, llvm::Function::ExternalLinkage, name, module);
+	main_func->setDLLStorageClass(llvm::Function::DLLExportStorageClass);
+
+	llvm::Argument* vm_ = main_func->arg_begin();
+	llvm::Argument* globals = main_func->arg_begin() + 1;
+	//llvm::Argument* stack = main_func->arg_begin() + 2;
+
+	llvm::BasicBlock* entry_bb =
+		llvm::BasicBlock::Create(context, "main_entry", main_func);
+	llvm::IRBuilder<> builder(entry_bb);
+
+	llvm::AllocaInst* stack =
+		builder.CreateAlloca(value_type, builder.getInt32(12500), "stack");
+	llvm::AllocaInst* stack_top =
+		builder.CreateAlloca(int32_type, nullptr, "stack_top");
+	builder.CreateStore(builder.getInt32(1), stack_top);
+
+	llvm::Function* _jit_func = module->getFunction("_jit_func");
+	llvm::Value* res = builder.CreateCall(_jit_func, {vm_, globals, stack, stack_top}, "jit_func");
+
+
+	builder.CreateRet(res);
+	return main_func;
+}
+
+llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, const std::string& name, llvm::GlobalValue::LinkageTypes linkage, llvm::StructType* value_type, llvm::PointerType* valutePtr_type)
 {
 	llvm::LLVMContext& context = module->getContext();
 
 	// Add a declaration for external functions used in the JITed code. We use
+	llvm::Type* uint64_type = llvm::Type::getInt64Ty(context);
 	llvm::Type* int32_type = llvm::Type::getInt32Ty(context);
-	llvm::Type* int64_type = llvm::Type::getInt64Ty(context);
 	llvm::Type* void_type = llvm::Type::getVoidTy(context);
 	llvm::Type* uint8_type = llvm::Type::getInt8Ty(context);
 	llvm::Type* double_type = llvm::Type::getDoubleTy(context);
 	llvm::Type* bool_type = llvm::Type::getInt1Ty(context);
+	llvm::ArrayType* chunk_type = llvm::ArrayType::get(uint8_type, sizeof(Chunk));
 
-	llvm::PointerType* voidPtr_type = llvm::PointerType::get(void_type, 0);
+	llvm::PointerType* voidPtr_type = llvm::Type::getInt8PtrTy(context);
 	llvm::PointerType* in64Ptr_type = llvm::Type::getInt64PtrTy(context);
+	llvm::PointerType* in32Ptr_type = llvm::Type::getInt32PtrTy(context);
+	llvm::Type* uint8Ptr_type = llvm::Type::getInt8PtrTy(context);
 	llvm::PointerType* boolPtr_type = llvm::Type::getInt1PtrTy(context);
 
-	llvm::StructType* obj_type = llvm::StructType::create(context, "SObj");
+	llvm::StructType* obj_type = llvm::StructType::create(context, {uint8Ptr_type, uint64_type, uint8_type}, "Obj");
 	llvm::PointerType* objPtr_type = llvm::PointerType::get(obj_type, 0);
-	obj_type->setBody({objPtr_type, int64_type, uint8_type});
+	llvm::PointerType* objPtrPtr_type = llvm::PointerType::get(objPtr_type, 0);
 
+	llvm::StructType* objFunction_type = llvm::StructType::create(context,{uint8Ptr_type, uint64_type, uint8_type, int32_type, uint8Ptr_type, uint8Ptr_type, chunk_type}, "objFunction");
+	llvm::PointerType* objFunctionPtr_type = llvm::PointerType::get(objFunction_type, 0);
 
-	llvm::Function* numberError_func = llvm::Function::Create(
-			llvm::FunctionType::get(void_type, {voidPtr_type, int32_type}, false),
-			llvm::Function::ExternalLinkage, "numberError", module);
-	numberError_func->setDoesNotThrow();
-	numberError_func->setDoesNotRecurse();
+	llvm::StructType* objNative_type = llvm::StructType::create(context,{uint8Ptr_type, uint64_type, uint8_type, uint8Ptr_type}, "objNative");
+	llvm::PointerType* objNativePtr_type = llvm::PointerType::get(objNative_type, 0);
 
-	llvm::Function* variableError_func = llvm::Function::Create(
-			llvm::FunctionType::get(void_type, {voidPtr_type, int32_type}, false),
-			llvm::Function::ExternalLinkage, "variableError", module);
-	variableError_func->setDoesNotThrow();
-	variableError_func->setDoesNotRecurse();
-
-	/*llvm::Function* equal_func = llvm::Function::Create(
-			llvm::FunctionType::get(bool_type, {valutePtr_type, valutePtr_type}, false),
-			llvm::Function::ExternalLinkage, "equal", module);
-	equal_func->setOnlyReadsMemory();*/
-
-	llvm::Function* concatenate_func = llvm::Function::Create(
-			llvm::FunctionType::get(int32_type, {voidPtr_type, valutePtr_type, valutePtr_type, valutePtr_type}, false),
-			llvm::Function::ExternalLinkage, "concatenate", module);
-	concatenate_func->setOnlyAccessesArgMemory();
-	concatenate_func->setDoesNotThrow();
-	concatenate_func->setDoesNotRecurse();
-
-	llvm::Function* print_func = llvm::Function::Create(
-			llvm::FunctionType::get(void_type, {valutePtr_type}, false),
-			llvm::Function::ExternalLinkage, "print", module);
-	print_func->setOnlyReadsMemory();
-	print_func->setOnlyAccessesArgMemory();
-
-	llvm::Function* dump_memory_func = llvm::Function::Create(
-			llvm::FunctionType::get(void_type, {llvm::Type::getInt8PtrTy(context)}, false),
-			llvm::Function::ExternalLinkage, "dump_memory", module);
+	llvm::Function* callError_func = module->getFunction("callError");
+	llvm::Function* numberError_func = module->getFunction("numberError");
+	llvm::Function* variableError_func = module->getFunction("variableError");
+	llvm::Function* arityError_func = module->getFunction("arityError");
+	llvm::Function* concatenate_func = module->getFunction("concatenate");
+	llvm::Function* print_func = module->getFunction("print");
+	llvm::Function* callNative_func = module->getFunction("callNative");
 
 	llvm::Function* is_falsey = module->getFunction("_is_falsey");
 
 	llvm::Function* equal_func = module->getFunction("_equal");
 
-	// generate falsey function
-	/*llvm::Function* is_falsey = generate_falsey(module, value_type, valutePtr_type);
-	if (llvm::verifyFunction(*is_falsey, &llvm::errs()))
-		DIE << "Error verifying function.";
-	// generate equal function
-	llvm::Function* equal_func = generate_equal(module, value_type, valutePtr_type);
-	if (llvm::verifyFunction(*equal_func, &llvm::errs()))
-		DIE << "Error verifying function.";*/
-
-
-	// Create function signature and object. int (*)(VM*, Value*, Value*, Value*)
+	// Create function signature and object. int (*)(VM*, Value*, Value*, int*)
 	llvm::FunctionType* jit_func_type =
-			llvm::FunctionType::get(int32_type, {voidPtr_type, valutePtr_type, valutePtr_type, valutePtr_type}, false);
+		llvm::FunctionType::get(int32_type, {voidPtr_type, valutePtr_type, valutePtr_type, in32Ptr_type}, false);
 	llvm::Function* jit_func = llvm::Function::Create(
-			jit_func_type, llvm::Function::ExternalLinkage, "_jit_func", module);
+		jit_func_type, linkage, name, module);
+	if (linkage != llvm::Function::InternalLinkage)
+		jit_func->setDLLStorageClass(llvm::Function::DLLExportStorageClass);
 
 	llvm::Argument* vm_ = jit_func->arg_begin();
-	//llvm::Argument* stack = jit_func->arg_begin() + 1;
-	//llvm::Argument* constants = jit_func->arg_begin() + 2;
-	llvm::Argument* globals = jit_func->arg_begin() + 3;
+	llvm::Argument* globals = jit_func->arg_begin() + 1;
+	llvm::Argument* stack_ = jit_func->arg_begin() + 2;
+	llvm::Argument* stack_top = jit_func->arg_begin() + 3;
 
 	llvm::BasicBlock* entry_bb =
-			llvm::BasicBlock::Create(context, "entry", jit_func);
+		llvm::BasicBlock::Create(context, "entry", jit_func);
+	llvm::BasicBlock* return_bb =
+		llvm::BasicBlock::Create(context, "return", jit_func);
 	llvm::IRBuilder<> builder(entry_bb);
 
 	auto const_0 = builder.getInt32(0);
@@ -406,19 +389,17 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 	auto type_obj = builder.getInt8(static_cast<uint8_t>(ValueType::OBJ));
 	auto type_nil = builder.getInt8(static_cast<uint8_t>(ValueType::NIL));
 	auto type_undefined = builder.getInt8(static_cast<uint8_t>(ValueType::UNDEFINED));
-	auto value_size = builder.getInt64(sizeof(Value));
 
-	llvm::AllocaInst* stack =
-			builder.CreateAlloca(value_type, builder.getInt32(12500), "stack");
+	auto type_obj_function = builder.getInt8(static_cast<uint8_t>(ObjType::FUNCTION));
+	auto type_obj_native = builder.getInt8(static_cast<uint8_t>(ObjType::NATIVE));
+	auto type_obj_string = builder.getInt8(static_cast<uint8_t>(ObjType::STRING));
 
 	llvm::AllocaInst* constants =
-			builder.CreateAlloca(value_type, builder.getInt32(chunk->constantsSize()), "constants");
+		builder.CreateAlloca(value_type, builder.getInt32(chunk->constantsSize()), "constants");
 	for (size_t i = 0; i < chunk->constantsSize(); ++i)
 	{
 		auto &constant = chunk->constants()[i];
 		llvm::Value* elem_addr = builder.CreateInBoundsGEP(constants, {builder.getInt32(i)}, "elem_addr");
-		//llvm::Value* elem_type_ptr = builder.CreateStructGEP(value_type, elem_addr, 0, "type_ptr");
-		//llvm::Value* elem_value_ptr = builder.CreateStructGEP(value_type, elem_addr, 1, "value_ptr");
 		switch (constant.type())
 		{
 			default:
@@ -426,29 +407,29 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				break;
 			case ValueType::NUMBER: {
 				builder.CreateStore(llvm::ConstantStruct::get(value_type,
-						{type_number, llvm::ConstantFP::get(double_type, constant.asNumber())}), elem_addr);
+															  {type_number, llvm::ConstantFP::get(double_type,
+															  	constant.asNumber())}), elem_addr);
 				break;
 			}
 			case ValueType::OBJ: {
-				auto addr = builder.getInt64((size_t)constant.asObj());
-				auto ptr = llvm::ConstantExpr::getIntToPtr(addr, objPtr_type);
+				auto ptr = builder.getInt64(reinterpret_cast<size_t>(constant.asObj()));
 				llvm::Value* elem_type_ptr = builder.CreateStructGEP(value_type, elem_addr, 0, "type_ptr");
 				builder.CreateStore(type_obj, elem_type_ptr);
 				llvm::Value* elem_value_ptr = builder.CreateStructGEP(value_type, elem_addr, 1, "value_ptr");
-				llvm::Value* elem_ptr = builder.CreateBitCast(elem_value_ptr, llvm::PointerType::get(objPtr_type, 0), "elem_ptr");
+				llvm::Value* elem_ptr = builder.CreateBitCast(elem_value_ptr, in64Ptr_type, "elem_ptr");
 				builder.CreateStore(ptr, elem_ptr);
 				break;
 			}
 		}
 	}
+	builder.CreateInvariantStart(constants, builder.getInt64(sizeof(Value) * chunk->constantsSize()));
 
-	llvm::AllocaInst* stack_top =
-			builder.CreateAlloca(int32_type, nullptr, "stack_top");
-	builder.CreateStore(builder.getInt32(0), stack_top);
+	llvm::AllocaInst* pc = builder.CreateAlloca(int32_type, nullptr, "pc");
+	builder.CreateStore(const_0, pc);
 
-	llvm::AllocaInst* pc =
-			builder.CreateAlloca(int32_type, nullptr, "pc");
-	builder.CreateStore(builder.getInt32(0), stack_top);
+	llvm::AllocaInst* stack_ptr = builder.CreateAlloca(valutePtr_type, nullptr, "stack_ptr");
+	builder.CreateStore(stack_, stack_ptr);
+	llvm::Value* stack = builder.CreateLoad(stack_ptr, "stack");
 
 	llvm::AllocaInst* alloc_temp_1 = builder.CreateAlloca(value_type, nullptr, "alloc_temp_1");
 	llvm::AllocaInst* alloc_temp_2 = builder.CreateAlloca(value_type, nullptr, "alloc_temp_2");
@@ -461,17 +442,15 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 	std::vector<llvm::BasicBlock*> blocks(size, nullptr);
 	for (auto val: jump_blocks)
 	{
-		auto name = (std::to_string(val) + std::string("_bb")).c_str();
-		blocks[val] = llvm::BasicBlock::Create(context, name, jit_func);
+		auto name_ = (std::to_string(val) + std::string("_bb"));
+		blocks[val] = llvm::BasicBlock::Create(context, name_, jit_func);
 	}
 
 	builder.CreateBr(blocks[0]);
 	for (auto offset = 0u; offset < size;)
 	{
-		if (jump_blocks.find(offset) != jump_blocks.end()) {
-			//set block
-			builder.SetInsertPoint(blocks[offset]);
-		}
+		//set block
+		builder.SetInsertPoint(blocks[offset]);
 
 		auto instruction = chunk->get(offset);
 		switch (instruction)
@@ -490,7 +469,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				// push constant to stack
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
 				llvm::Value* elem_addr = builder.CreateInBoundsGEP(stack, {stacktop}, "elem_addr");
-				//builder.CreateLifetimeStart(elem_addr, value_size);
 				builder.CreateStore(constant, elem_addr);
 
 				llvm::Value* inc_stacktop = builder.CreateAdd(stacktop, const_1, "inc_stacktop");
@@ -507,8 +485,8 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 			{
 				// get index_
 				uint32_t index_ = chunk->get(offset + 1u) |
-									static_cast<uint32_t>(chunk->get(offset + 2u) << 8u) |
-									static_cast<uint32_t>(chunk->get(offset + 3) << 16u);
+								  static_cast<uint32_t>(chunk->get(offset + 2u) << 8u) |
+								  static_cast<uint32_t>(chunk->get(offset + 3) << 16u);
 				auto index_val = builder.getInt32(index_);
 
 				// get constant
@@ -519,7 +497,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				// push constant to stack
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
 				llvm::Value* elem_addr = builder.CreateInBoundsGEP(stack, {stacktop}, "elem_addr");
-				//builder.CreateLifetimeStart(elem_addr, value_size);
 				builder.CreateStore(constant, elem_addr);
 
 				llvm::Value* inc_stacktop = builder.CreateAdd(stacktop, const_1, "inc_stacktop");
@@ -536,10 +513,9 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 			{
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
 				llvm::Value* elem_addr = builder.CreateInBoundsGEP(stack, {stacktop}, "elem_addr");
-				//builder.CreateLifetimeStart(elem_addr, value_size);
 
 				builder.CreateStore(llvm::ConstantStruct::get(value_type,
-						{type_nil, llvm::ConstantFP::get(double_type, 0.0)}), elem_addr);;
+															  {type_nil, llvm::ConstantFP::get(double_type, 0.0)}), elem_addr);
 
 				llvm::Value* inc_stacktop = builder.CreateAdd(stacktop, const_1, "inc_stacktop");
 				builder.CreateStore(inc_stacktop, stack_top);
@@ -555,7 +531,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 			{
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
 				llvm::Value* elem_addr = builder.CreateInBoundsGEP(stack, {stacktop}, "elem_addr");
-				//builder.CreateLifetimeStart(elem_addr, value_size);
 
 				llvm::Value* elem_type_ptr = builder.CreateStructGEP(value_type, elem_addr, 0, "type_ptr");
 				builder.CreateStore(type_bool, elem_type_ptr);
@@ -579,7 +554,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 			{
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
 				llvm::Value* elem_addr = builder.CreateInBoundsGEP(stack, {stacktop}, "elem_addr");
-				//builder.CreateLifetimeStart(elem_addr, value_size);
 
 				llvm::Value* elem_type_ptr = builder.CreateStructGEP(value_type, elem_addr, 0, "type_ptr");
 				builder.CreateStore(type_bool, elem_type_ptr);
@@ -604,8 +578,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
 				llvm::Value* dec_stacktop = builder.CreateSub(stacktop, const_1, "dec_stacktop");
 				builder.CreateStore(dec_stacktop, stack_top);
-				llvm::Value* elem_addr = builder.CreateInBoundsGEP(stack, {stacktop}, "elem_addr");
-				//builder.CreateLifetimeEnd(elem_addr, value_size);
 
 				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(1), "inc_pc");
@@ -623,7 +595,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				llvm::Value* temp_elem = builder.CreateLoad(temp_addr, "elem");
 
 				llvm::Value* temp2_addr = builder.CreateInBoundsGEP(stack, {stacktop}, "elem2_addr");
-				//builder.CreateLifetimeStart(temp2_addr, value_size);
 				builder.CreateStore(temp_elem, temp2_addr);
 
 				llvm::Value* inc_stacktop = builder.CreateAdd(stacktop, const_1, "inc_stacktop");
@@ -647,7 +618,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
 				llvm::Value* temp_addr = builder.CreateInBoundsGEP(stack, {stacktop}, "temp_addr");
-				//builder.CreateLifetimeStart(temp_addr, value_size);
 				builder.CreateStore(slot_elem, temp_addr);
 
 				llvm::Value* inc_stacktop = builder.CreateAdd(stacktop, const_1, "inc_stacktop");
@@ -664,7 +634,7 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 			{
 				// get const_
 				uint16_t slot_ = chunk->get(offset + 1u) |
-								static_cast<uint16_t>(chunk->get(offset + 2u) << 8u);
+								 static_cast<uint16_t>(chunk->get(offset + 2u) << 8u);
 				auto slot_val = builder.getInt32(slot_);
 
 				llvm::Value* slot_addr = builder.CreateInBoundsGEP(stack, {slot_val}, "slot_addr");
@@ -672,7 +642,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
 				llvm::Value* temp_addr = builder.CreateInBoundsGEP(stack, {stacktop}, "temp_addr");
-				//builder.CreateLifetimeStart(temp_addr);
 				builder.CreateStore(slot_elem, temp_addr);
 
 				llvm::Value* inc_stacktop = builder.CreateAdd(stacktop, const_1, "inc_stacktop");
@@ -713,7 +682,7 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 			{
 				// get const_
 				uint16_t slot_ = chunk->get(offset + 1u) |
-								  static_cast<uint16_t>(chunk->get(offset + 2u) << 8u);
+								 static_cast<uint16_t>(chunk->get(offset + 2u) << 8u);
 				auto slot_val = builder.getInt32(slot_);
 
 				// get top elem
@@ -755,7 +724,8 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				builder.SetInsertPoint(then_bb);
 				// call variableError
-				builder.CreateCall(variableError_func, {vm_, index_val});
+				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
+				builder.CreateCall(variableError_func, {vm_, index_val, pc_});
 				// return error code
 				builder.CreateRet(builder.getInt32(static_cast<int32_t>(InterpretResult::RUNTIME_ERROR)));
 
@@ -763,13 +733,12 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				// push value
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
 				llvm::Value* elem_addr = builder.CreateInBoundsGEP(stack, {stacktop}, "elem_addr");
-				//builder.CreateLifetimeStart(elem_addr, value_size);
 				builder.CreateStore(val, elem_addr);
 
 				llvm::Value* inc_stacktop = builder.CreateAdd(stacktop, const_1, "inc_stacktop");
 				builder.CreateStore(inc_stacktop, stack_top);
 
-				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
+				pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(2), "inc_pc");
 				builder.CreateStore(inc_pc, pc);
 				builder.CreateBr(blocks[offset + 2]);
@@ -780,8 +749,8 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 			{
 				// get const_
 				uint32_t index_ = chunk->get(offset + 1u) |
-								static_cast<uint32_t>(chunk->get(offset + 2u) << 8u) |
-								static_cast<uint32_t>(chunk->get(offset + 3u) << 16u);
+								  static_cast<uint32_t>(chunk->get(offset + 2u) << 8u) |
+								  static_cast<uint32_t>(chunk->get(offset + 3u) << 16u);
 				auto index_val = builder.getInt32(index_);
 
 				// get value from globals
@@ -799,7 +768,8 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				builder.SetInsertPoint(then_bb);
 				// call variableError
-				builder.CreateCall(variableError_func, {vm_, index_val});
+				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
+				builder.CreateCall(variableError_func, {vm_, index_val, pc_});
 				// return error code
 				builder.CreateRet(builder.getInt32(static_cast<int32_t>(InterpretResult::RUNTIME_ERROR)));
 
@@ -807,13 +777,12 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				// push value
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
 				llvm::Value* elem_addr = builder.CreateInBoundsGEP(stack, {stacktop}, "elem_addr");
-				//builder.CreateLifetimeStart(elem_addr, value_size);
 				builder.CreateStore(val, elem_addr);
 
 				llvm::Value* inc_stacktop = builder.CreateAdd(stacktop, const_1, "inc_stacktop");
 				builder.CreateStore(inc_stacktop, stack_top);
 
-				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
+				pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(4), "inc_pc");
 				builder.CreateStore(inc_pc, pc);
 				builder.CreateBr(blocks[offset + 4]);
@@ -829,6 +798,7 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				// get element at stack_top - 1
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
 				llvm::Value* temp = builder.CreateSub(stacktop, const_1, "temp");
+
 				llvm::Value* stack_val_addr = builder.CreateInBoundsGEP(stack, {temp}, "stack_val_addr");
 				llvm::Value* stack_val = builder.CreateLoad(stack_val_addr, "stack_val");
 
@@ -838,7 +808,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				// pop value from stack
 				builder.CreateStore(temp, stack_top);
-				//builder.CreateLifetimeEnd(stack_val_addr, value_size);
 
 				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(2), "inc_pc");
@@ -858,6 +827,7 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				// get element at stack_top - 1
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
 				llvm::Value* temp = builder.CreateSub(stacktop, const_1, "temp");
+
 				llvm::Value* stack_val_addr = builder.CreateInBoundsGEP(stack, {temp}, "stack_val_addr");
 				llvm::Value* stack_val = builder.CreateLoad(stack_val_addr, "stack_val");
 
@@ -867,7 +837,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				// pop value from stack
 				builder.CreateStore(temp, stack_top);
-				//builder.CreateLifetimeEnd(stack_val_addr, value_size);
 
 				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(4), "inc_pc");
@@ -895,7 +864,8 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				builder.SetInsertPoint(then_bb);
 				// call variableError
-				builder.CreateCall(variableError_func, {vm_, index_val});
+				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
+				builder.CreateCall(variableError_func, {vm_, index_val, pc_});
 				// return error code
 				builder.CreateRet(builder.getInt32(static_cast<int32_t>(InterpretResult::RUNTIME_ERROR)));
 
@@ -904,13 +874,14 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				// get element at stack_top - 1
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
 				llvm::Value* temp = builder.CreateSub(stacktop, const_1, "temp");
+
 				llvm::Value* stack_val_addr = builder.CreateInBoundsGEP(stack, {temp}, "stack_val_addr");
 				llvm::Value* stack_val = builder.CreateLoad(stack_val_addr, "stack_val");
 
 				// store element in globals at index
 				builder.CreateStore(stack_val, val_addr);
 
-				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
+				pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(2), "inc_pc");
 				builder.CreateStore(inc_pc, pc);
 				builder.CreateBr(blocks[offset + 2]);
@@ -938,7 +909,8 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				builder.SetInsertPoint(then_bb);
 				// call variableError
-				builder.CreateCall(variableError_func, {vm_, index_val});
+				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
+				builder.CreateCall(variableError_func, {vm_, index_val, pc_});
 				// return error code
 				builder.CreateRet(builder.getInt32(static_cast<int32_t>(InterpretResult::RUNTIME_ERROR)));
 
@@ -947,13 +919,14 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				// get element at stack_top - 1
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
 				llvm::Value* temp = builder.CreateSub(stacktop, const_1, "temp");
+
 				llvm::Value* stack_val_addr = builder.CreateInBoundsGEP(stack, {temp}, "stack_val_addr");
 				llvm::Value* stack_val = builder.CreateLoad(stack_val_addr, "stack_val");
 
 				// store element in globals at index
 				builder.CreateStore(stack_val, val_addr);
 
-				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
+				pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(4), "inc_pc");
 				builder.CreateStore(inc_pc, pc);
 				builder.CreateBr(blocks[offset + 4]);
@@ -962,7 +935,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 			}
 			case OpCode::EQUAL:
 			{
-				// call equal func
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
 
 				// get top element
@@ -984,7 +956,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				// pop
 				builder.CreateStore(temp, stack_top);
-				//builder.CreateLifetimeEnd(b_addr, value_size);
 
 				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(1), "inc_pc");
@@ -996,7 +967,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 			case OpCode::GREATER:
 			{
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
-				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 
 				// get top element
 				llvm::Value* temp = builder.CreateSub(stacktop, const_1, "temp");
@@ -1022,6 +992,7 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				builder.CreateCondBr(comp_3, then_bb, else_bb);
 
 				builder.SetInsertPoint(then_bb);
+				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 				builder.CreateCall(numberError_func, {vm_, pc_});
 
 				// return error code
@@ -1044,8 +1015,8 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				// pop value
 				builder.CreateStore(temp, stack_top);
-				//builder.CreateLifetimeEnd(b_addr, value_size);
 
+				pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(1), "inc_pc");
 				builder.CreateStore(inc_pc, pc);
 				builder.CreateBr(blocks[offset + 1]);
@@ -1055,7 +1026,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 			case OpCode::LESS:
 			{
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
-				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 
 				// get top element
 				llvm::Value* temp = builder.CreateSub(stacktop, const_1, "temp");
@@ -1081,6 +1051,7 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				builder.CreateCondBr(comp_3, then_bb, else_bb);
 
 				builder.SetInsertPoint(then_bb);
+				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 				builder.CreateCall(numberError_func, {vm_, pc_});
 
 				// return error code
@@ -1088,26 +1059,23 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 
 				builder.SetInsertPoint(else_bb);
-				builder.CreateStore(builder.CreateLoad(a_addr), alloc_temp_1);
-				builder.CreateStore(builder.CreateLoad(b_addr), alloc_temp_2);
-				llvm::Value* temp1_number_addr = builder.CreateStructGEP(value_type, a_addr, 1, "a_number_addr");
-				llvm::Value* a_number = builder.CreateLoad(temp1_number_addr, "a_number");
 
-				llvm::Value* temp2_number_addr = builder.CreateStructGEP(value_type, b_addr, 1, "b_number_addr");
-				llvm::Value* b_number = builder.CreateLoad(temp2_number_addr, "b_number");
+				llvm::Value* a_number_addr = builder.CreateStructGEP(value_type, a_addr, 1, "a_number_addr");
+				llvm::Value* a_number = builder.CreateLoad(a_number_addr, "a_number");
+				llvm::Value* b_number_addr = builder.CreateStructGEP(value_type, b_addr, 1, "b_number_addr");
+				llvm::Value* b_number = builder.CreateLoad(b_number_addr, "b_number");
 
 				llvm::Value* less_cmp = builder.CreateFCmpOLT(a_number, b_number, "less_cmp");
 
 				// store result
-				llvm::Value* a_number_addr = builder.CreateStructGEP(value_type, a_addr, 1, "a_number_addr");
 				builder.CreateStore(type_bool, a_type_addr);
 				llvm::Value* a_bool_ptr = builder.CreateBitCast(a_number_addr, boolPtr_type, "a_bool_ptr");
 				builder.CreateStore(less_cmp, a_bool_ptr);
 
 				// pop value
 				builder.CreateStore(temp, stack_top);
-				//builder.CreateLifetimeEnd(b_addr, value_size);
 
+				pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(1), "inc_pc");
 				builder.CreateStore(inc_pc, pc);
 				builder.CreateBr(blocks[offset + 1]);
@@ -1132,8 +1100,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				llvm::Value* b_type_addr = builder.CreateStructGEP(value_type, b_addr, 0, "b_type_addr");
 				llvm::Value* b_type = builder.CreateLoad(b_type_addr, "b_type");
 
-
-
 				auto comp_1 = builder.CreateICmpNE(a_type, type_number, "comp_1");
 				auto comp_2 = builder.CreateICmpNE(b_type, type_number, "comp_2");
 				auto comp_3 = builder.CreateOr(comp_1, comp_2, "comp_3");
@@ -1146,13 +1112,13 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				builder.CreateCondBr(comp_3, then_bb, else_bb);
 
 				builder.SetInsertPoint(then_bb);
-
 				builder.CreateStore(builder.CreateLoad(a_addr), alloc_temp_1);
 				builder.CreateStore(builder.CreateLoad(b_addr), alloc_temp_2);
 
-				llvm::Value* status = builder.CreateCall(concatenate_func, {vm_, alloc_temp_1, alloc_temp_2, alloc_temp_3}, "status");
+				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
+				llvm::Value* status =
+					builder.CreateCall(concatenate_func, {vm_, alloc_temp_3, alloc_temp_1, alloc_temp_2, pc_}, "status");
 				builder.CreateStore(builder.CreateLoad(alloc_temp_3), a_addr);
-
 				llvm::Value* _ok = builder.getInt32(static_cast<int32_t>(InterpretResult::OK));
 				llvm::Value* cmp_status = builder.CreateICmpEQ(status, _ok, "cmp_status");
 				builder.CreateCondBr(cmp_status, end_bb, error_bb);
@@ -1164,11 +1130,11 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				builder.SetInsertPoint(else_bb);
 
 				llvm::Value* a_number_addr = builder.CreateStructGEP(value_type, a_addr, 1, "a_number_addr");
-				llvm::Value* a_number = builder.CreateLoad(a_number_addr, "a_number");
+				llvm::Value* a_numer = builder.CreateLoad(a_number_addr, "a_number");
 				llvm::Value* b_number_addr = builder.CreateStructGEP(value_type, b_addr, 1, "b_number_addr");
-				llvm::Value* b_number = builder.CreateLoad(b_number_addr, "b_number");
+				llvm::Value* b_numer = builder.CreateLoad(b_number_addr, "b_number");
 
-				llvm::Value* res = builder.CreateFAdd(a_number, b_number);
+				llvm::Value* res = builder.CreateFAdd(a_numer, b_numer);
 
 				// store result
 				builder.CreateStore(res, a_number_addr);
@@ -1177,9 +1143,8 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				builder.SetInsertPoint(end_bb);
 				// pop value
 				builder.CreateStore(temp, stack_top);
-				//builder.CreateLifetimeEnd(b_addr, value_size);
 
-				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
+				pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(1), "inc_pc");
 				builder.CreateStore(inc_pc, pc);
 				builder.CreateBr(blocks[offset + 1]);
@@ -1189,7 +1154,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 			case OpCode::SUBTRACT:
 			{
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
-				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 
 				// get top element
 				llvm::Value* temp = builder.CreateSub(stacktop, const_1, "temp");
@@ -1215,6 +1179,7 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				builder.CreateCondBr(comp_3, then_bb, else_bb);
 
 				builder.SetInsertPoint(then_bb);
+				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 				builder.CreateCall(numberError_func, {vm_, pc_});
 
 				// return error code
@@ -1235,8 +1200,8 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				// pop value
 				builder.CreateStore(temp, stack_top);
-				//builder.CreateLifetimeEnd(b_addr,value_size);
 
+				pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(1), "inc_pc");
 				builder.CreateStore(inc_pc, pc);
 				builder.CreateBr(blocks[offset + 1]);
@@ -1246,7 +1211,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 			case OpCode::MULTIPLY:
 			{
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
-				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 
 				// get top element
 				llvm::Value* temp = builder.CreateSub(stacktop, const_1, "temp");
@@ -1272,6 +1236,7 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				builder.CreateCondBr(comp_3, then_bb, else_bb);
 
 				builder.SetInsertPoint(then_bb);
+				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 				builder.CreateCall(numberError_func, {vm_, pc_});
 
 				// return error code
@@ -1292,8 +1257,8 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				// pop value
 				builder.CreateStore(temp, stack_top);
-				//builder.CreateLifetimeEnd(b_addr, value_size);
 
+				pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(1), "inc_pc");
 				builder.CreateStore(inc_pc, pc);
 				builder.CreateBr(blocks[offset + 1]);
@@ -1303,7 +1268,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 			case OpCode::DIVIDE:
 			{
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
-				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 
 				// get top element
 				llvm::Value* temp = builder.CreateSub(stacktop, const_1, "temp");
@@ -1329,6 +1293,7 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				builder.CreateCondBr(comp_3, then_bb, else_bb);
 
 				builder.SetInsertPoint(then_bb);
+				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 				builder.CreateCall(numberError_func, {vm_, pc_});
 
 				// return error code
@@ -1349,8 +1314,8 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				// pop value
 				builder.CreateStore(temp, stack_top);
-				//builder.CreateLifetimeEnd(b_addr, value_size);
 
+				pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(1), "inc_pc");
 				builder.CreateStore(inc_pc, pc);
 				builder.CreateBr(blocks[offset + 1]);
@@ -1360,7 +1325,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 			case OpCode::MODULO:
 			{
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
-				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 
 				// get top element
 				llvm::Value* temp = builder.CreateSub(stacktop, const_1, "temp");
@@ -1386,6 +1350,7 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				builder.CreateCondBr(comp_3, then_bb, else_bb);
 
 				builder.SetInsertPoint(then_bb);
+				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 				builder.CreateCall(numberError_func, {vm_, pc_});
 
 				// return error code
@@ -1406,8 +1371,8 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				// pop value
 				builder.CreateStore(temp, stack_top);
-				//builder.CreateLifetimeEnd(b_addr, value_size);
 
+				pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(1), "inc_pc");
 				builder.CreateStore(inc_pc, pc);
 				builder.CreateBr(blocks[offset + 1]);
@@ -1443,7 +1408,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 			case OpCode::NEGATE:
 			{
 				llvm::Value* stacktop = builder.CreateLoad(stack_top, "stacktop");
-				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 
 				// get top element
 				llvm::Value* temp = builder.CreateSub(stacktop, const_1, "temp");
@@ -1460,6 +1424,7 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				builder.CreateCondBr(cmp, then_bb, else_bb);
 
 				builder.SetInsertPoint(then_bb);
+				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 				builder.CreateCall(numberError_func, {vm_, pc_});
 				// return error code
 				builder.CreateRet(builder.getInt32(static_cast<int32_t>(InterpretResult::RUNTIME_ERROR)));
@@ -1473,6 +1438,7 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 				// store result
 				builder.CreateStore(res, val_number_addr);
 
+				pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(1), "inc_pc");
 				builder.CreateStore(inc_pc, pc);
 				builder.CreateBr(blocks[offset + 1]);
@@ -1485,7 +1451,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				// get top element
 				llvm::Value* temp = builder.CreateSub(stacktop, const_1, "temp");
-
 				llvm::Value* val_addr = builder.CreateInBoundsGEP(stack, {temp}, "val_addr");
 				builder.CreateStore(builder.CreateLoad(val_addr), alloc_temp_1);
 
@@ -1493,7 +1458,6 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				// pop element
 				builder.CreateStore(temp, stack_top);
-				//builder.CreateLifetimeEnd(val_addr, value_size);
 
 				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
 				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(1), "inc_pc");
@@ -1509,7 +1473,7 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 								static_cast<uint16_t>(chunk->get(offset + 2u) << 8u);
 
 				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
-				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(3), "inc_pc");
+				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(3 + jump), "inc_pc");
 				builder.CreateStore(inc_pc, pc);
 				builder.CreateBr(blocks[offset + 3 + jump]);
 				offset += 3;
@@ -1530,10 +1494,11 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 								static_cast<uint16_t>(chunk->get(offset + 2u) << 8u);
 
 				llvm::Value* cmp = builder.CreateICmpEQ(res, builder.getTrue());
+				llvm::BasicBlock* rtn = llvm::BasicBlock::Create(context, "rtn_jmp", jit_func);
 
-				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
-				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(3), "inc_pc");
-				builder.CreateStore(inc_pc, pc);
+				gen_if_else_jmp(cmp, pc, 3 + jump, 3, builder, context, jit_func, rtn);
+
+				builder.SetInsertPoint(rtn);
 				builder.CreateCondBr(cmp, blocks[offset + 3 + jump], blocks[offset + 3]);
 				offset += 3;
 				break;
@@ -1550,13 +1515,14 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 
 				// jump
 				uint16_t jump = chunk->get(offset + 1u) |
-				                static_cast<uint16_t>(chunk->get(offset + 2u) << 8u);
+								static_cast<uint16_t>(chunk->get(offset + 2u) << 8u);
 
 				llvm::Value* cmp = builder.CreateICmpEQ(res, builder.getFalse());
+				llvm::BasicBlock* rtn = llvm::BasicBlock::Create(context, "rtn_jmp", jit_func);
 
-				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
-				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(3), "inc_pc");
-				builder.CreateStore(inc_pc, pc);
+				gen_if_else_jmp(cmp, pc, 3 + jump, 3, builder, context, jit_func, rtn);
+
+				builder.SetInsertPoint(rtn);
 				builder.CreateCondBr(cmp, blocks[offset + 3 + jump], blocks[offset + 3]);
 				offset += 3;
 				break;
@@ -1565,17 +1531,167 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 			{
 				// jump
 				uint16_t jump = chunk->get(offset + 1u) |
-				                static_cast<uint16_t>(chunk->get(offset + 2u) << 8u);
+								static_cast<uint16_t>(chunk->get(offset + 2u) << 8u);
 
 				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
-				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(3), "inc_pc");
+				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(3 - jump), "inc_pc");
 				builder.CreateStore(inc_pc, pc);
 				builder.CreateBr(blocks[offset + 3 - jump]);
 				offset += 3;
 				break;
 			}
+			case OpCode::CALL:
+			{
+				llvm::PointerType* funcPtr_type = llvm::PointerType::get(jit_func_type, 0);
+				llvm::PointerType* funcPtrPtr_type = llvm::PointerType::get(funcPtr_type, 0);
+
+				llvm::FunctionType* native_func_type =  llvm::FunctionType::get(value_type,{int32_type, valutePtr_type}, false);
+				llvm::PointerType* nativePtr_type = llvm::PointerType::get(native_func_type, 0);
+				llvm::PointerType* nativePtrPtr_type = llvm::PointerType::get(nativePtr_type, 0);
+
+				auto arg_count = chunk->get(offset + 1u);
+				auto argCount = builder.getInt32(arg_count);
+
+				// get top - argCount element
+				llvm::Value* temp = builder.CreateSub(builder.CreateLoad(stack_top, "stacktop"),builder.CreateAdd(argCount, const_1, "argcount_1"), "temp");
+				llvm::Value* c_addr = builder.CreateInBoundsGEP(stack, {temp}, "b_addr");
+
+				llvm::Value* c_type_addr = builder.CreateStructGEP(value_type, c_addr, 0, "c_type_addr");
+				llvm::Value* c_type = builder.CreateLoad(c_type_addr, "c_type");
+				llvm::Value* c_value_addr = builder.CreateStructGEP(value_type, c_addr, 1, "c_value_addr");
+
+				auto comp_1 = builder.CreateICmpEQ(c_type, type_obj, "comp_1");
+
+				llvm::BasicBlock* then_bb = llvm::BasicBlock::Create(context, "then_obj", jit_func);
+				llvm::BasicBlock* else_bb = llvm::BasicBlock::Create(context, "else_obj", jit_func);
+				llvm::BasicBlock* end_bb = llvm::BasicBlock::Create(context, "end_obj", jit_func);
+
+				builder.CreateCondBr(comp_1, then_bb, else_bb);
+				builder.SetInsertPoint(then_bb);
+				{
+					llvm::Value* c_obj_ptr_addr = builder.CreateBitCast(c_value_addr, objPtrPtr_type, "c_obj_ptr_addr");
+					llvm::Value* c_obj_addr = builder.CreateLoad(c_obj_ptr_addr, "c_obj_addr");
+
+					llvm::Value* c_obj_type_addr = builder.CreateStructGEP(obj_type, c_obj_addr, 2, "c_obj_type_addr");
+					llvm::Value* c_obj_type = builder.CreateLoad(c_obj_type_addr, "c_obj_type");
+					auto comp_function = builder.CreateICmpEQ(c_obj_type, type_obj_function, "comp_function");
+					auto comp_native = builder.CreateICmpEQ(c_obj_type, type_obj_native, "type_obj_native");
+
+					llvm::BasicBlock* then_fun_bb = llvm::BasicBlock::Create(context, "then_fun_bb", jit_func);
+					llvm::BasicBlock* else_fun_bb = llvm::BasicBlock::Create(context, "else_fun_bb", jit_func);
+
+					llvm::BasicBlock* then_nat_bb = llvm::BasicBlock::Create(context, "then_nat_bb", jit_func);
+					llvm::BasicBlock* else_nat_bb = llvm::BasicBlock::Create(context, "else_nat_bb", jit_func);
+
+
+					builder.CreateCondBr(comp_function, then_fun_bb, else_fun_bb);
+					builder.SetInsertPoint(then_fun_bb);
+					{
+						// IS FUNCTION
+						llvm::Value* temp_top = builder.CreateAdd(argCount, const_1, "temp_top");
+						//llvm::AllocaInst* temp_stack_top = builder.CreateAlloca(int32_type, nullptr, "temp_stack_top");
+						builder.CreateStore(temp_top, stack_top);
+
+						llvm::Value* callee_obj_addr = builder.CreateBitCast(c_obj_addr, objFunctionPtr_type, "callee_obj_addr");
+						// CHECK ARITY
+						llvm::Value* arity_addr = builder.CreateStructGEP(objFunction_type, callee_obj_addr, 3, "arity_addr");
+						llvm::Value* arity = builder.CreateLoad(arity_addr, "arity");
+						auto comp_arity = builder.CreateICmpNE(argCount, arity);
+						llvm::BasicBlock* then_arity_bb = llvm::BasicBlock::Create(context, "then_arity_bb", jit_func);
+						llvm::BasicBlock* else_arity_bb = llvm::BasicBlock::Create(context, "else_arity_bb", jit_func);
+						builder.CreateCondBr(comp_arity, then_arity_bb, else_arity_bb);
+						builder.SetInsertPoint(then_arity_bb);
+						// INCORRECT NUMBER OF ARGUMENTS
+						llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
+						builder.CreateCall(arityError_func, {vm_, arity, argCount, pc_});
+						builder.CreateRet(builder.getInt32(static_cast<int32_t>(InterpretResult::RUNTIME_ERROR)));
+
+						// CORRECT NUMBER OF ARGUMENTS
+						builder.SetInsertPoint(else_arity_bb);
+						llvm::Value* callee_ptr_raw_addr = builder.CreateStructGEP(objFunction_type, callee_obj_addr, 5, "callee_ptr_raw_addr");
+						llvm::Value* callee_ptr_addr = builder.CreateBitCast(callee_ptr_raw_addr, funcPtrPtr_type, "callee_ptr_addr");
+						llvm::Value* callee_addr = builder.CreateLoad(callee_ptr_addr, "callee_addr");
+						llvm::Value* status = builder.CreateCall(callee_addr, {vm_, globals, c_addr, stack_top}, "status");
+
+						// HANDLE RUNTIME ERROR
+						auto status_comp = builder.CreateICmpNE(status, builder.getInt32(static_cast<int32_t>(InterpretResult::OK)));
+						llvm::BasicBlock* then_status_bb = llvm::BasicBlock::Create(context, "then_status_bb", jit_func);
+						llvm::BasicBlock* else_status_bb = llvm::BasicBlock::Create(context, "else_status_bb", jit_func);
+						builder.CreateCondBr(status_comp, then_status_bb, else_status_bb);
+						builder.SetInsertPoint(then_status_bb);
+						builder.CreateRet(builder.getInt32(static_cast<int32_t>(InterpretResult::RUNTIME_ERROR)));
+						builder.SetInsertPoint(else_status_bb);
+						// GET RESULT
+						llvm::Value* temp_st = builder.CreateSub(builder.CreateLoad(stack_top), const_1, "temp_st");
+						llvm::Value* val_addr = builder.CreateInBoundsGEP(c_addr, {temp_st}, "val_addr");
+						// RECOVER STACK
+						builder.CreateStore(temp, stack_top);
+						// SAVE RESULT
+						llvm::Value* stackTop = builder.CreateLoad(stack_top, "stackTop");
+						llvm::Value* res_addr = builder.CreateInBoundsGEP(stack, {stackTop}, "res");
+						builder.CreateStore(builder.CreateLoad(val_addr, "val"), res_addr);
+						// INCREMENT STACK
+						llvm::Value* inc_stack_top = builder.CreateAdd(stackTop, const_1, "inc_stack_top");
+						builder.CreateStore(inc_stack_top, stack_top);
+
+						builder.CreateBr(end_bb);
+					}
+					builder.SetInsertPoint(else_fun_bb);
+					{
+						builder.CreateCondBr(comp_native, then_nat_bb, else_nat_bb);
+						builder.SetInsertPoint(then_nat_bb);
+						{
+							// IS NATIVE
+							llvm::Value* c_obj_fun_addr = builder.CreateBitCast(c_obj_addr, objNativePtr_type, "c_obj_nat_addr");
+							llvm::Value* callee_ptr_raw_addr = builder.CreateStructGEP(objNative_type, c_obj_fun_addr, 3, "callee_ptr_raw_addr");
+							llvm::Value* callee_ptr_addr = builder.CreateBitCast(callee_ptr_raw_addr, nativePtrPtr_type, "callee_ptr_addr");
+							llvm::Value* callee_addr = builder.CreateLoad(callee_ptr_addr, "callee_addr");
+
+							builder.CreateCall(callNative_func, {callee_addr, const_1, c_addr, alloc_temp_3});
+
+							// RECOVER STACK
+							builder.CreateStore(temp, stack_top);
+							// SAVE RESULT
+							llvm::Value* stackTop = builder.CreateLoad(stack_top, "stackTop");
+							llvm::Value* res_addr = builder.CreateInBoundsGEP(stack, {stackTop}, "res");
+							builder.CreateStore(builder.CreateLoad(alloc_temp_3, "val"), res_addr);
+							// INCREMENT STACK
+							llvm::Value* inc_stack_top = builder.CreateAdd(stackTop, const_1, "inc_stack_top");
+							builder.CreateStore(inc_stack_top, stack_top);
+
+							// finish
+							builder.CreateBr(end_bb);
+						}
+						builder.SetInsertPoint(else_nat_bb);
+						{
+							// OBJECT IS NOT CALLABLE
+							llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
+							builder.CreateCall(callError_func, {vm_, pc_});
+							// return error code
+							builder.CreateRet(builder.getInt32(static_cast<int32_t>(InterpretResult::RUNTIME_ERROR)));
+						}
+					}
+				}
+				builder.SetInsertPoint(else_bb);
+				{
+					// VALUE IS NOT CALLABLE
+					llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
+					builder.CreateCall(callError_func, {vm_, pc_});
+					// return error code
+					builder.CreateRet(builder.getInt32(static_cast<int32_t>(InterpretResult::RUNTIME_ERROR)));
+				}
+				builder.SetInsertPoint(end_bb);
+
+				llvm::Value* pc_ = builder.CreateLoad(pc, "pc_");
+				llvm::Value* inc_pc = builder.CreateAdd(pc_, builder.getInt32(1), "inc_pc");
+				builder.CreateStore(inc_pc, pc);
+				builder.CreateBr(blocks[offset + 2]);
+				offset += 2;
+				break;
+			}
 			case OpCode::RETURN:
 			{
+				builder.CreateBr(return_bb);
 				offset += 1;
 				break;
 			}
@@ -1585,6 +1701,7 @@ llvm::Function* generade_code(llvm::Module* module, Chunk* chunk, llvm::StructTy
 		}
 	}
 
+	builder.SetInsertPoint(return_bb);
 	builder.CreateRet(builder.getInt32(static_cast<int32_t>(InterpretResult::OK)));
 	return jit_func;
 }

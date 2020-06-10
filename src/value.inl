@@ -1,5 +1,3 @@
-#include "object.hpp"
-
 template <typename _T>
 inline Value::Value(_T value)
 {
@@ -28,65 +26,7 @@ inline Value::Value(_T value)
 inline Value::Value() : m_type(ValueType::UNDEFINED), m_as( 0.0 )
 {}
 
-inline Value Value::Bool(bool value)
-{
-	return Value(value);
-}
 
-inline Value Value::Nil()
-{
-	return Value(nullptr);
-}
-
-inline Value Value::Number(double value)
-{
-	return Value(value);
-}
-
-inline Value Value::Object(Obj *value)
-{
-	return Value(value);
-}
-
-inline Value Value::Undefined()
-{
-	return Value();
-}
-
-inline bool Value::asBool() const
-{
-	return m_as.boolean;
-}
-
-inline double Value::asNumber() const
-{
-	return m_as.number;
-}
-
-inline Obj *Value::asObj() const
-{
-	return m_as.obj;
-}
-
-inline ObjString *Value::asObjString() const
-{
-	return static_cast<ObjString*>(asObj());
-}
-
-inline std::string_view Value::asString() const
-{
-	return asObjString()->value;
-}
-
-inline ObjFunction *Value::asObjFunction() const
-{
-	return static_cast<ObjFunction*>(asObj());
-}
-
-inline ObjNative *Value::asObjNative() const
-{
-	return static_cast<ObjNative*>(asObj());
-}
 
 inline bool Value::isBool() const
 {
@@ -138,35 +78,6 @@ inline ValueType Value::type() const
 	return m_type;
 }
 
-inline ObjType Value::objType() const
-{
-	return asObj()->type;
-}
-
-inline std::ostream &operator<<(std::ostream &os, const Value &value)
-{
-	switch (value.m_type)
-	{
-		case ValueType::BOOL:
-			os << std::boolalpha << value.m_as.boolean;
-			break;
-		case ValueType::NIL:
-			os << "nil";
-			break;
-		case ValueType::NUMBER:
-			os << value.m_as.number;
-			break;
-		case ValueType::OBJ:
-			os << *value.m_as.obj;
-			break;
-		default:
-			os << "undefined";
-			break;
-	}
-
-	return os;
-}
-
 inline bool operator==(const Value &lhs, const Value &rhs)
 {
 	if (lhs.m_type != rhs.m_type)
@@ -196,6 +107,8 @@ template <class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
 
 //std::visit
 
+size_t obj_hash(sObj* obj);
+
 namespace std {
 	template <> struct hash<Value>
 	{
@@ -206,7 +119,7 @@ namespace std {
 				case ValueType::BOOL: return val.asBool() ? 3 : 5;
 				case ValueType::NIL: return 7;
 				case ValueType::NUMBER: return std::hash<double>()(val.asNumber());
-				case ValueType::OBJ: return val.asObj()->hash;
+				case ValueType::OBJ: return obj_hash(val.asObj());
 				case ValueType::UNDEFINED: return 7;
 			}
 			return 0;

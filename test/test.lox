@@ -1,0 +1,48 @@
+var x = 1000;
+var limit = 25000;
+
+{
+    var sum = 0;
+    var exit = false;
+    for(var a = 0; a < x; a = a + 1) {
+        for (var b = 0; b < x; b = b + 1 ) {
+            sum = sum + a + b;
+            if (sum > limit) {
+                print ("End of first for loop");
+                exit = true;
+                break;
+            }
+        }
+        if (exit) {
+            var c;
+            print ("End of second for loop");
+            break;
+        }
+    }
+    print (sum);
+}
+
+{
+    var sum = 0;
+    var exit = false;
+    var a = 0;
+    while(a < x) {
+        var b = 0;
+        while(b < x) {
+            sum = sum + a + b;
+            if (sum > limit) {
+                print ("End of first while loop");
+                exit = true;
+                break;
+            }
+            b = b + 1;
+        }
+        if (exit) {
+            var c;
+            print ("End of second while loop");
+            break;
+        }
+        a = a + 1;
+    }
+    print (sum);
+}

@@ -112,7 +112,7 @@ inline void VM::runtimeError(Types ... args)
 }
 
 template <class... Types>
-inline void VM::runtimeError(int pc, Types ... args)
+inline void VM::runtimeError(uint32_t pc, Types ... args)
 {
 	auto argList = {args...};
 	for (auto &&arg: argList)
@@ -120,7 +120,7 @@ inline void VM::runtimeError(int pc, Types ... args)
 		std::cerr << arg;
 	}
 	std::cerr << std::endl;
-	auto index = pc - 1;
+	auto index = pc;
 	std::cerr << "[line " << m_frame->function->chunk.getLine(index) << "]" << std::endl;
 	m_stack.reset();
 }
